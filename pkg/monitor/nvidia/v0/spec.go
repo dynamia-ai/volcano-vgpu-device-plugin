@@ -20,6 +20,9 @@ import "unsafe"
 
 const maxDevices = 16
 
+// CacheFileSize includes the extra byte appended by the legacy C cache writer.
+const CacheFileSize = int(unsafe.Sizeof(sharedRegionT{})) + 1
+
 type deviceMemory struct {
 	contextSize uint64
 	moduleSize  uint64
@@ -149,6 +152,18 @@ func CastSpec(data []byte) Spec {
 	return Spec{
 		sr: (*sharedRegionT)(unsafe.Pointer(&data[0])),
 	}
+}
+
+// ValidCache checks fields at the offsets of the legacy, unversioned C layout.
+// The first twelve bytes alone are ambiguous with a truncated v1.2 cache.
+func ValidCache(data []byte) bool {
+	if len(data) != CacheFileSize {
+		return false
+	}
+	sr := (*sharedRegionT)(unsafe.Pointer(&data[0]))
+	return sr.initializedFlag == 19920718 &&
+		(sr.smInitFlag == 0 || sr.smInitFlag == 1) &&
+		sr.num > 0 && sr.num <= maxDevices && sr.procnum >= 0 && sr.procnum <= 1024
 }
 
 //	func (s *SharedRegionT) UsedMemory(idx int) (uint64, error) {
