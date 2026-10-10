@@ -486,6 +486,10 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 				ops.Failed(nodeName, current)
 				return nil, err
 			}
+			if err := plugin.validateRegisteredVolcanoGPUs(devreq); err != nil {
+				ops.Failed(nodeName, current)
+				return nil, err
+			}
 			deviceIDs, err := plugin.GetContainerDeviceStrArray(devreq)
 			if err != nil {
 				ops.Failed(nodeName, current)
@@ -757,6 +761,27 @@ func validateVolcanoDeviceLimits(devices util.ContainerDevices) error {
 		if device.Usedcores != devices[0].Usedcores {
 			// HAMi-core exposes one SM limit per container, not per GPU.
 			return errors.New("Volcano assigned different GPU core limits within one container")
+		}
+	}
+	return nil
+}
+
+// Ordinary GPU IDs in the scheduler annotation must be present among this
+// plugin's registered physical GPUs. Geometry placeholders are resolved by the
+// MIG path before their eventual instance IDs can be checked there.
+func (plugin *nvidiaDevicePlugin) validateRegisteredVolcanoGPUs(devices util.ContainerDevices) error {
+	registered := make(map[string]bool)
+	for _, device := range plugin.rm.Devices() {
+		if device != nil {
+			registered[device.GetUUID()] = true
+		}
+	}
+	for _, device := range devices {
+		if strings.Contains(device.UUID, "[") {
+			continue
+		}
+		if !registered[device.UUID] {
+			return fmt.Errorf("Volcano-assigned GPU %q is not registered on this node", device.UUID)
 		}
 	}
 	return nil
