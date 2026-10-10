@@ -44,6 +44,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
@@ -78,6 +79,7 @@ type nvidiaDevicePlugin struct {
 	pluginapi.UnimplementedDevicePluginServer
 	ctx                  context.Context
 	rm                   rm.ResourceManager
+	nvml                 nvml.Interface
 	config               *spec.Config
 	deviceListStrategies spec.DeviceListStrategies
 
@@ -100,11 +102,45 @@ type nvidiaDevicePlugin struct {
 	cacheManager *vgpucache.Manager
 	cacheCancel  context.CancelFunc
 	cacheDone    chan struct{}
+	allocateMu   sync.Mutex
+	podOps       podAllocationOperations
 
 	// entryLimitWarned keeps the device count warning to one line per plugin,
 	// since apiDevices runs again on every health event. Only ListAndWatch
 	// reaches it, so no synchronisation is needed.
 	entryLimitWarned bool
+}
+
+type podAllocationOperations interface {
+	PendingPod(string, int) (*corev1.Pod, error)
+	PatchAnnotations(*corev1.Pod, map[string]string) error
+	Failed(string, *corev1.Pod)
+	TrySuccess(string, *corev1.Pod) error
+}
+
+type kubernetesPodAllocationOperations struct{}
+
+func (kubernetesPodAllocationOperations) PendingPod(node string, count int) (*corev1.Pod, error) {
+	return util.GetPendingPod(node, count)
+}
+
+func (kubernetesPodAllocationOperations) PatchAnnotations(pod *corev1.Pod, annotations map[string]string) error {
+	return util.PatchPodAnnotations(pod, annotations)
+}
+
+func (kubernetesPodAllocationOperations) Failed(node string, pod *corev1.Pod) {
+	util.PodAllocationFailed(node, pod)
+}
+
+func (kubernetesPodAllocationOperations) TrySuccess(node string, pod *corev1.Pod) error {
+	return util.PodAllocationTrySuccess(node, pod)
+}
+
+func (plugin *nvidiaDevicePlugin) allocationOps() podAllocationOperations {
+	if plugin.podOps != nil {
+		return plugin.podOps
+	}
+	return kubernetesPodAllocationOperations{}
 }
 
 // devicePluginForResource creates a device plugin for the specified resource.
@@ -117,6 +153,7 @@ func (o *options) devicePluginForResource(ctx context.Context, resourceManager r
 	plugin := nvidiaDevicePlugin{
 		ctx:                  ctx,
 		rm:                   resourceManager,
+		nvml:                 config.Nvml(),
 		config:               o.config,
 		deviceListStrategies: o.deviceListStrategies,
 
@@ -125,7 +162,8 @@ func (o *options) devicePluginForResource(ctx context.Context, resourceManager r
 
 		imexChannels: o.imexChannels,
 
-		mps: mpsOptions,
+		mps:    mpsOptions,
+		podOps: kubernetesPodAllocationOperations{},
 
 		socket: getPluginSocketPath(resourceManager.Resource()),
 		// These will be reinitialized every
@@ -324,7 +362,11 @@ func (plugin *nvidiaDevicePlugin) GetDevicePluginOptions(context.Context, *plugi
 
 // ListAndWatch lists devices and update that list according to the health status
 func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
-	if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
+	devices, err := plugin.apiDevices()
+	if err != nil {
+		return err
+	}
+	if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: devices}); err != nil {
 		return err
 	}
 	for {
@@ -332,11 +374,18 @@ func (plugin *nvidiaDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.D
 		case <-plugin.stop:
 			return nil
 		case d := <-plugin.health:
+			if d == nil {
+				return errors.New("device health channel closed")
+			}
 			// FIXME: there is no way to recover from the Unhealthy state.
 			d.Health = pluginapi.Unhealthy
 			klog.Infof("'%s' device marked unhealthy: %s", plugin.rm.Resource(), d.ID)
-			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
-				return nil
+			devices, err := plugin.apiDevices()
+			if err != nil {
+				return err
+			}
+			if err := s.Send(&pluginapi.ListAndWatchResponse{Devices: devices}); err != nil {
+				return fmt.Errorf("send updated device list: %w", err)
 			}
 		}
 	}
@@ -362,8 +411,15 @@ func (plugin *nvidiaDevicePlugin) GetPreferredAllocation(ctx context.Context, r 
 
 // Allocate returns a list of devices.
 func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	if len(reqs.ContainerRequests) > 1 {
-		return &pluginapi.AllocateResponse{}, errors.New("multiple Container Requests not supported")
+	if reqs == nil || len(reqs.ContainerRequests) == 0 {
+		return nil, errors.New("allocate request has no containers")
+	}
+	gpuAmount := 0
+	for _, request := range reqs.ContainerRequests {
+		if request == nil || len(request.DevicesIds) == 0 {
+			return nil, errors.New("allocate request contains an empty device list")
+		}
+		gpuAmount += len(request.DevicesIds)
 	}
 	responses := pluginapi.AllocateResponse{}
 	if plugin.rm.Resource() != spec.ResourceName(util.ResourceName) {
@@ -372,9 +428,13 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 		}
 		return &responses, nil
 	}
+	// The Volcano annotation is a sequential queue of container allocations.
+	// Serialize the read/prepare/write sequence across kubelet Allocate RPCs.
+	plugin.allocateMu.Lock()
+	defer plugin.allocateMu.Unlock()
+	ops := plugin.allocationOps()
 	nodeName := os.Getenv("NODE_NAME")
-	gpuAmount := len(reqs.ContainerRequests[0].DevicesIds)
-	current, err := util.GetPendingPod(nodeName, gpuAmount)
+	current, err := ops.PendingPod(nodeName, gpuAmount)
 	if err != nil {
 		nodelock.ReleaseNodeLock(nodeName, util.VGPUDeviceName)
 		return &pluginapi.AllocateResponse{}, err
@@ -385,58 +445,60 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 		return &pluginapi.AllocateResponse{}, errors.New("no pending pod found on node")
 	}
 	klog.V(3).InfoS("Current pending pod.", "UID", current.UID, "pod name", current.Name)
+	requestSizes := make([]int, len(reqs.ContainerRequests))
+	hasMIG := false
+	for index, request := range reqs.ContainerRequests {
+		requestSizes[index] = len(request.DevicesIds)
+		hasMIG = hasMIG || strings.Contains(request.DevicesIds[0], "MIG")
+	}
+	if hasMIG && len(reqs.ContainerRequests) != 1 {
+		ops.Failed(nodeName, current)
+		return nil, errors.New("mixed or multi-container MIG Allocate is not supported")
+	}
+	var planned []util.PlannedDeviceRequest
+	var remainingAnnotation string
+	if !hasMIG {
+		planned, remainingAnnotation, err = util.PlanDeviceRequests(util.NvidiaGPUDevice, *current, requestSizes)
+		if err != nil {
+			ops.Failed(nodeName, current)
+			return nil, err
+		}
+	}
 
 	for idx, req := range reqs.ContainerRequests {
 		if strings.Contains(req.DevicesIds[0], "MIG") {
 			if plugin.config.Sharing.TimeSlicing.FailRequestsGreaterThanOne && rm.AnnotatedIDs(req.DevicesIds).AnyHasAnnotations() {
 				if len(req.DevicesIds) > 1 {
-					util.PodAllocationFailed(nodeName, current)
+					ops.Failed(nodeName, current)
 					return nil, fmt.Errorf("request for '%v: %v' too large: maximum request size for shared resources is 1", plugin.rm.Resource(), len(req.DevicesIds))
 				}
 			}
 
 			for _, id := range req.DevicesIds {
 				if !plugin.rm.Devices().Contains(id) {
-					util.PodAllocationFailed(nodeName, current)
+					ops.Failed(nodeName, current)
 					return nil, fmt.Errorf("invalid allocation request for '%s': unknown device: %s", plugin.rm.Resource(), id)
 				}
 			}
 
 			response, err := plugin.getAllocateResponse(req.DevicesIds)
 			if err != nil {
-				util.PodAllocationFailed(nodeName, current)
+				ops.Failed(nodeName, current)
 				return nil, fmt.Errorf("failed to get allocate response: %v", err)
-			}
-			err = util.EraseNextDeviceTypeFromAnnotation(util.NvidiaGPUDevice, *current)
-			if err != nil {
-				klog.Errorln("Erase annotation failed", err.Error())
-				util.PodAllocationFailed(nodeName, current)
-				return &pluginapi.AllocateResponse{}, err
 			}
 			responses.ContainerResponses = append(responses.ContainerResponses, response)
 		} else {
 
-			currentCtr, devreq, err := util.GetNextDeviceRequest(util.NvidiaGPUDevice, *current)
+			currentCtr, devreq := planned[idx].Container, planned[idx].Devices
 			klog.V(4).InfoS("Selected Pod deviceAllocateFromAnnotation=", "request", devreq)
-			//klog.V(4).InfoS("reqs device ids=", "deviceIDs", reqs.ContainerRequests[idx].DevicesIDs)
-			if err != nil {
-				klog.Errorln("get device from annotation failed", err.Error())
-				util.PodAllocationFailed(nodeName, current)
-				return &pluginapi.AllocateResponse{}, err
-			}
-			if len(devreq) != len(reqs.ContainerRequests[idx].DevicesIds) {
-				klog.Errorln("device number not matched", devreq, reqs.ContainerRequests[idx].DevicesIds)
-				util.PodAllocationFailed(nodeName, current)
-				return &pluginapi.AllocateResponse{}, errors.New("device number not matched")
-			}
-
 			deviceIDs, err := plugin.GetContainerDeviceStrArray(devreq)
 			if err != nil {
-				util.PodAllocationFailed(nodeName, current)
+				ops.Failed(nodeName, current)
 				return nil, err
 			}
 			response, err := plugin.getAllocateResponse(deviceIDs)
 			if err != nil {
+				ops.Failed(nodeName, current)
 				return nil, fmt.Errorf("failed to get allocate response: %v", err)
 			}
 
@@ -457,12 +519,12 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 				hostHookPath := os.Getenv("HOOK_PATH")
 				cacheFileHostDirectory, err := plugin.prepareCache(string(current.UID), currentCtr.Name)
 				if err != nil {
-					util.PodAllocationFailed(nodeName, current)
+					ops.Failed(nodeName, current)
 					return nil, fmt.Errorf("prepare vGPU cache: %w", err)
 				}
 				cacheName, err := vgpucache.CacheFileName(cacheFileHostDirectory)
 				if err != nil {
-					util.PodAllocationFailed(nodeName, current)
+					ops.Failed(nodeName, current)
 					return nil, fmt.Errorf("select vGPU cache: %w", err)
 				}
 				response.Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"] = filepath.Join("/tmp/vgpu", cacheName)
@@ -500,8 +562,19 @@ func (plugin *nvidiaDevicePlugin) Allocate(ctx context.Context, reqs *pluginapi.
 			responses.ContainerResponses = append(responses.ContainerResponses, response)
 		}
 	}
+	if !hasMIG {
+		if err := ops.PatchAnnotations(current, map[string]string{
+			util.AssignedIDsToAllocateAnnotations: remainingAnnotation,
+		}); err != nil {
+			ops.Failed(nodeName, current)
+			return nil, fmt.Errorf("consume Volcano allocation annotation: %w", err)
+		}
+	}
 	klog.Infoln("Allocate Response", responses.ContainerResponses)
-	util.PodAllocationTrySuccess(nodeName, current)
+	if err := ops.TrySuccess(nodeName, current); err != nil {
+		ops.Failed(nodeName, current)
+		return nil, fmt.Errorf("finish Volcano allocation: %w", err)
+	}
 	return &responses, nil
 }
 
@@ -659,7 +732,7 @@ func (plugin *nvidiaDevicePlugin) uniqueDeviceIDsFromAnnotatedDeviceIDs(ids []st
 	return uniqueIDs
 }
 
-func (plugin *nvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
+func (plugin *nvidiaDevicePlugin) apiDevices() ([]*pluginapi.Device, error) {
 	devs := plugin.rm.Devices().GetPluginDevices()
 	/*if strings.Compare(plugin.migStrategy, "mixed") == 0 {
 		return devs
@@ -667,17 +740,22 @@ func (plugin *nvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
 	var res []*pluginapi.Device
 
 	if plugin.rm.Resource() == spec.ResourceName(util.ResourceMem) {
+		if config.GPUMemoryFactor == 0 {
+			return nil, errors.New("gpuMemoryFactor must be positive")
+		}
+		nvmllib := plugin.nvml
+		if nvmllib == nil {
+			nvmllib = config.Nvml()
+		}
 		for _, dev := range devs {
-			ndev, ret := config.Nvml().DeviceGetHandleByUUID(dev.ID)
+			ndev, ret := nvmllib.DeviceGetHandleByUUID(dev.ID)
 			if ret != nvml.SUCCESS {
-				fmt.Println("nvml new device by uuid error id=", dev.ID)
-				panic(ret)
+				return nil, fmt.Errorf("get NVML device %q: %v", dev.ID, ret)
 			}
 
-			memory, ret := config.Nvml().DeviceGetMemoryInfo(ndev)
+			memory, ret := nvmllib.DeviceGetMemoryInfo(ndev)
 			if ret != nvml.SUCCESS {
-				fmt.Println("failed to get memory info for device id=", dev.ID)
-				panic(ret)
+				return nil, fmt.Errorf("get NVML memory for %q: %v", dev.ID, ret)
 			}
 			registeredmem := int(memory.Total/(1024*1024)) / int(config.GPUMemoryFactor)
 			i := 0
@@ -698,7 +776,7 @@ func (plugin *nvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
 				klog.Warning(err)
 			}
 		}
-		return res
+		return res, nil
 	} else if plugin.rm.Resource() == spec.ResourceName(util.ResourceCores) {
 		for _, dev := range devs {
 			coresNum := int(100 * config.DeviceCoresScaling)
@@ -712,7 +790,7 @@ func (plugin *nvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
 				i++
 			}
 		}
-		return res
+		return res, nil
 	}
 
 	for _, dev := range devs {
@@ -725,7 +803,7 @@ func (plugin *nvidiaDevicePlugin) apiDevices() []*pluginapi.Device {
 			})
 		}
 	}
-	return res
+	return res, nil
 }
 
 // updateResponseForDeviceListEnvVar sets the environment variable for the requested devices.
