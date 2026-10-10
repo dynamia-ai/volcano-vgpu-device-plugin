@@ -20,6 +20,10 @@ import "unsafe"
 
 const maxDevices = 16
 
+// SharedRegionSize is the mapped HAMi-core region size. Its layout is verified
+// against shared_region_t on linux/amd64 by TestSharedRegionLayout.
+const SharedRegionSize = unsafe.Sizeof(sharedRegionT{})
+
 type deviceMemory struct {
 	contextSize uint64
 	moduleSize  uint64
@@ -59,7 +63,7 @@ type sharedRegionT struct {
 	majorVersion    int32
 	minorVersion    int32
 	smInitFlag      int32
-	ownerPid        uint32
+	ownerPid        uint64
 	sem             semT
 	num             uint64
 	uuids           [16]uuid
@@ -73,7 +77,7 @@ type sharedRegionT struct {
 	recentKernel      int32
 	priority          int32
 	lastKernelTime    int64
-	unused            [4]uint64
+	semPostinit       semT
 }
 
 type Spec struct {
