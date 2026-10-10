@@ -252,11 +252,16 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 	}
 	if info.Size() == 1197897 {
 		usage.Info = v0.CastSpec(usage.data)
-	} else if head.majorVersion == 1 {
+	} else if head.majorVersion == 1 && head.minorVersion == 2 {
+		if info.Size() < int64(v1.SharedRegionSize) {
+			_ = syscall.Munmap(usage.data)
+			return nil, fmt.Errorf("cache file size %d too small for v1.2 region (%d)", info.Size(), v1.SharedRegionSize)
+		}
 		usage.Info = v1.CastSpec(usage.data)
 	} else {
+		major, minor := head.majorVersion, head.minorVersion
 		_ = syscall.Munmap(usage.data)
-		return nil, fmt.Errorf("unknown cache file size %d version %d.%d", info.Size(), head.majorVersion, head.minorVersion)
+		return nil, fmt.Errorf("unknown cache file size %d version %d.%d", info.Size(), major, minor)
 	}
 	return usage, nil
 }
