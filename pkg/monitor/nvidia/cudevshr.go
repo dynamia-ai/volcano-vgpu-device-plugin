@@ -223,14 +223,6 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 		klog.Infof("No cache file in %s", fpath)
 		return nil, nil
 	}
-	info, err := os.Stat(cacheFile)
-	if err != nil {
-		klog.Errorf("Failed to stat cache file: %s, error: %v", cacheFile, err)
-		return nil, err
-	}
-	if info.Size() < int64(unsafe.Sizeof(headerT{})) {
-		return nil, fmt.Errorf("cache file size %d too small", info.Size())
-	}
 	f, err := os.OpenFile(cacheFile, os.O_RDWR, 0666)
 	if err != nil {
 		klog.Errorf("Failed to open cache file: %s, error: %v", cacheFile, err)
@@ -239,6 +231,13 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 	defer func(f *os.File) {
 		_ = f.Close()
 	}(f)
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat open cache file %s: %w", cacheFile, err)
+	}
+	if info.Size() < int64(unsafe.Sizeof(headerT{})) {
+		return nil, fmt.Errorf("cache file size %d too small", info.Size())
+	}
 	usage := &ContainerUsage{}
 	usage.data, err = syscall.Mmap(int(f.Fd()), 0, int(info.Size()), syscall.PROT_WRITE|syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
@@ -250,14 +249,14 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 		_ = syscall.Munmap(usage.data)
 		return nil, fmt.Errorf("cache file magic flag not matched")
 	}
-	if info.Size() == 1197897 {
-		usage.Info = v0.CastSpec(usage.data)
-	} else if head.majorVersion == 1 && head.minorVersion == 2 {
+	if head.majorVersion == 1 && head.minorVersion == 2 {
 		if info.Size() < int64(v1.SharedRegionSize) {
 			_ = syscall.Munmap(usage.data)
 			return nil, fmt.Errorf("cache file size %d too small for v1.2 region (%d)", info.Size(), v1.SharedRegionSize)
 		}
 		usage.Info = v1.CastSpec(usage.data)
+	} else if v0.ValidCache(usage.data) {
+		usage.Info = v0.CastSpec(usage.data)
 	} else {
 		major, minor := head.majorVersion, head.minorVersion
 		_ = syscall.Munmap(usage.data)
