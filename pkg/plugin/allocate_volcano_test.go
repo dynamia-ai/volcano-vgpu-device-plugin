@@ -262,3 +262,48 @@ func TestListAndWatchPropagatesSendFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestAllocateCacheFailureDoesNotConsumeAnnotation(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "active", Annotations: map[string]string{util.AssignedIDsToAllocateAnnotations: "GPU-A,NVIDIA,1000,20:"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "gpu"}}}}
+	plugin, ops := newVolcanoTestPlugin(t, pod)
+	root := filepath.Join(t.TempDir(), "blocked")
+	require.NoError(t, os.WriteFile(root, nil, 0600))
+	list := func() ([]*corev1.Pod, error) { return []*corev1.Pod{pod}, nil }
+	manager, err := vgpucache.New(vgpucache.Config{Root: root, ScanInterval: time.Second}, list, list)
+	require.NoError(t, err)
+	plugin.cacheManager = manager
+	response, err := plugin.Allocate(context.Background(), &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"replica-0"}}}})
+	require.Nil(t, response)
+	require.ErrorContains(t, err, "prepare vGPU cache")
+	require.Nil(t, ops.patched)
+	require.Zero(t, ops.succeeded)
+}
+
+func TestAllocateRetryPreservesCacheFile(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "active", Annotations: map[string]string{util.AssignedIDsToAllocateAnnotations: "GPU-A,NVIDIA,1000,20:"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "gpu"}}}}
+	plugin, _ := newVolcanoTestPlugin(t, pod)
+	request := &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"replica-0"}}}}
+	first, err := plugin.Allocate(context.Background(), request)
+	require.NoError(t, err)
+	cacheName := first.ContainerResponses[0].Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"]
+	path := filepath.Join(os.Getenv("HOOK_PATH"), "vgpu", "containers", "active_gpu", filepath.Base(cacheName))
+	require.NoError(t, os.WriteFile(path, []byte("active usage"), 0600))
+	again, err := plugin.Allocate(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, cacheName, again.ContainerResponses[0].Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"])
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "active usage", string(data))
+}
+
+func TestAllocateMIGFailureDoesNotConsumeAnnotation(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "mig", Annotations: map[string]string{util.AssignedIDsToAllocateAnnotations: "GPU-A[group2-0],NVIDIA,1000,20:"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "gpu"}}}}
+	plugin, ops := newVolcanoTestPlugin(t, pod)
+	config.Mode = "mig"
+	plugin.migBackend = &fakeMIG{exportErr: errors.New("hardware export unavailable")}
+	response, err := plugin.Allocate(context.Background(), &pluginapi.AllocateRequest{ContainerRequests: []*pluginapi.ContainerAllocateRequest{{DevicesIds: []string{"replica-0"}}}})
+	require.Nil(t, response)
+	require.ErrorContains(t, err, "hardware export unavailable")
+	require.Nil(t, ops.patched)
+	require.Zero(t, ops.succeeded)
+}
