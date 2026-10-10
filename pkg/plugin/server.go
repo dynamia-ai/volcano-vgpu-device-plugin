@@ -208,13 +208,18 @@ func (plugin *nvidiaDevicePlugin) Devices() rm.Devices {
 func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	plugin.initialize()
 
-	_, err := util.GetDeviceNums()
-	if err != nil {
-		return errors.Join(err, plugin.Stop())
+	nvmllib := plugin.nvml
+	if nvmllib == nil {
+		nvmllib = config.Nvml()
+	}
+	if _, ret := nvmllib.DeviceGetCount(); ret != nvml.SUCCESS {
+		plugin.cleanup()
+		return fmt.Errorf("get NVML device count: %v", ret)
 	}
 
 	if err := plugin.mps.waitForDaemon(); err != nil {
-		return errors.Join(fmt.Errorf("error waiting for MPS daemon: %w", err), plugin.Stop())
+		plugin.cleanup()
+		return fmt.Errorf("error waiting for MPS daemon: %w", err)
 	}
 
 	if err := plugin.startCacheManager(); err != nil {
@@ -229,7 +234,7 @@ func (plugin *nvidiaDevicePlugin) Start(kubeletSocket string) error {
 	}
 	klog.Infof("Starting to serve '%s' on %s", plugin.rm.Resource(), plugin.socket)
 
-	err = plugin.Register(kubeletSocket)
+	err := plugin.Register(kubeletSocket)
 	if err != nil {
 		klog.Errorf("Could not register device plugin: %s", err)
 		return errors.Join(err, plugin.Stop())
