@@ -19,8 +19,12 @@ package plugin
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
+	"volcano.sh/k8s-device-plugin/pkg/vgpucache"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/stretchr/testify/require"
@@ -69,6 +73,12 @@ func newVolcanoTestPlugin(t *testing.T, pod *corev1.Pod) (*nvidiaDevicePlugin, *
 	t.Cleanup(func() {
 		util.ResourceName, config.Mode, config.GPUMemoryFactor = oldResource, oldMode, oldFactor
 	})
+	if pod.UID == "" {
+		pod.UID = "test-pod"
+	}
+	list := func() ([]*corev1.Pod, error) { return []*corev1.Pod{pod}, nil }
+	manager, err := vgpucache.New(vgpucache.Config{Root: filepath.Join(os.Getenv("HOOK_PATH"), "vgpu", "containers"), ScanInterval: time.Second}, list, list)
+	require.NoError(t, err)
 	ops := &testPodOps{pod: pod}
 	return &nvidiaDevicePlugin{
 		rm: &rm.ResourceManagerMock{
@@ -85,6 +95,7 @@ func newVolcanoTestPlugin(t *testing.T, pod *corev1.Pod) (*nvidiaDevicePlugin, *
 		}}},
 		deviceListStrategies: spec.DeviceListStrategies{"envvar": true},
 		podOps:               ops,
+		cacheManager:         manager,
 	}, ops
 }
 
