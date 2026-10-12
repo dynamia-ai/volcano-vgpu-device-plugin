@@ -1,5 +1,7 @@
 # Volcano vgpu device plugin for Kubernetes
 
+This is the Dynamia AI maintained fork of [Project-HAMi/volcano-vgpu-device-plugin](https://github.com/Project-HAMi/volcano-vgpu-device-plugin). See [fork maintenance](docs/fork-maintenance.md) for branch policy, validation, and known limitations.
+
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FProject-HAMi%2Fvolcano-vgpu-device-plugin.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FProject-HAMi%2Fvolcano-vgpu-device-plugin?ref=badge_shield)
 [![docker pulls](https://img.shields.io/docker/pulls/projecthami/volcano-vgpu-device-plugin.svg)](https://hub.docker.com/r/projecthami/volcano-vgpu-device-plugin)
 

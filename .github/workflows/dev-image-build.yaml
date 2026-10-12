@@ -27,6 +27,8 @@ on:
 
 jobs:
   build:
+    # Upstream publishing/build automation is not configured for organization forks.
+    if: github.repository == 'Project-HAMi/volcano-vgpu-device-plugin'
     runs-on: ubuntu-latest
     steps:
     - name: Free disk space
