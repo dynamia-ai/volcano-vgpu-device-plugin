@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: volcano-smoke
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vgpu-smoke
+  namespace: volcano-smoke
+spec:
+  schedulerName: volcano
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: docker.io/library/ubuntu:24.04
+    command: ["/bin/sh", "-c", "sleep infinity"]
+    resources:
+      limits:
+        volcano.sh/vgpu-number: 1
+        volcano.sh/vgpu-memory: 4096
+        volcano.sh/vgpu-cores: 50

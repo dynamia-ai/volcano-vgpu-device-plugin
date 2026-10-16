@@ -1,0 +1,13 @@
+gpu:
+  profile: t4
+  count: 2
+nodeSelector:
+  mokka.nvidia.com/type: sgpu
+nri:
+  enabled: true
+  excludedNamespaces:
+    - volcano-system
+image:
+  repository: ghcr.io/dynamia-ai/mokka-ubi8
+  tag: 0.4.0@sha256:7801912118e077753cb96e882e805ffe7bcf79e477ed88165637f3b4584ffe4e
+  pullPolicy: IfNotPresent
